@@ -1,0 +1,282 @@
+using System;
+using System.Reflection;
+using HarmonyLib;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using StardewModdingAPI;
+using StardewValley;
+using StardewValley.BellsAndWhistles;
+using StardewValley.Menus;
+using StardewValley.Objects;
+
+namespace VisualOutfits;
+
+[HarmonyPatch]
+public static class Patches
+{
+    // Toggle button tweak knobs.
+    private const int ToggleSize = 48;
+    private const int ToggleInset = 8;
+    private const int ToggleOffsetX = 0;
+    private const int ToggleOffsetY = 0;
+
+    private static readonly Rectangle ToggleSourceRect = new(128, 256, 64, 64);
+
+    private static readonly BindingFlags AnyInstance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    private static VisualEquipmentPanel? CurrentPanel { get; set; }
+
+    private static void Dbg(string message)
+    {
+        if (!ModEntry.DebugEnabled)
+            return;
+
+        ModEntry.Log?.Log(message, LogLevel.Debug);
+    }
+
+    private static void BeginVisualSwap(out GearState realGear)
+    {
+        Farmer player = Game1.player;
+        realGear = GearUtil.Capture(player);
+
+        VisualSwapContext.Begin(realGear);
+        GearUtil.Apply(player, GearUtil.LoadVisual());
+    }
+
+    private static void EndVisualSwap(GearState realGear)
+    {
+        Farmer player = Game1.player;
+        
+        // Temporarily disable swap context so onEquip runs normally
+        VisualSwapContext.End();
+        
+        // Re-apply vanilla equipment and let it call hooks normally
+        GearUtil.Apply(player, realGear);
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.draw), new[] { typeof(SpriteBatch) })]
+    [HarmonyPostfix]
+    private static void InventoryPage_draw_Postfix(InventoryPage __instance, SpriteBatch b)
+    {
+        // Draw toggle button on top.
+        DrawToggleButton(__instance, b);
+
+        // Draw visual panel if in visual mode
+        if (EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual)
+        {
+            if (CurrentPanel == null)
+            {
+                // Position panel to the right of the inventory
+                int x = __instance.xPositionOnScreen + __instance.width + 20;
+                int y = __instance.yPositionOnScreen;
+                CurrentPanel = new VisualEquipmentPanel(x, y);
+            }
+
+            CurrentPanel.Draw(b);
+        }
+        else
+        {
+            CurrentPanel = null;
+        }
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.receiveLeftClick))]
+    [HarmonyPriority(Priority.First)]
+    [HarmonyPrefix]
+    private static bool InventoryPage_receiveLeftClick_Prefix(InventoryPage __instance, int x, int y, bool playSound)
+    {
+        Rectangle toggleBounds = GetToggleBounds(__instance);
+        if (toggleBounds.Contains(x, y))
+        {
+            EquipmentManager.ToggleActiveSet();
+            if (playSound)
+                Game1.playSound("button1");
+
+            Dbg($"Toggle click: now {(EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual ? "visual" : "vanilla")}");
+            CurrentPanel = null; // Reset panel when toggling
+            return false;
+        }
+
+        // Handle clicks on visual panel
+        if (CurrentPanel != null && CurrentPanel.Bounds.Contains(x, y))
+        {
+            Item? heldItem = Game1.player.CursorSlotItem;
+            if (CurrentPanel.TryClickSlot(x, y, heldItem))
+            {
+                if (playSound)
+                    Game1.playSound("coin");
+                return false;
+            }
+        }
+
+        return true; // Let vanilla handle all other clicks
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.receiveRightClick))]
+    [HarmonyPrefix]
+    private static bool InventoryPage_receiveRightClick_Prefix(InventoryPage __instance, int x, int y, bool playSound)
+    {
+        // Handle right-click to clear visual slots
+        if (CurrentPanel != null && CurrentPanel.Bounds.Contains(x, y))
+        {
+            if (CurrentPanel.TryRightClickSlot(x, y))
+            {
+                if (playSound)
+                    Game1.playSound("dwop");
+                return false;
+            }
+        }
+
+        return true; // Let vanilla handle all other clicks
+    }
+
+    [HarmonyPatch(typeof(FarmerRenderer), nameof(FarmerRenderer.draw), new[] { typeof(SpriteBatch), typeof(Farmer), typeof(int), typeof(Vector2), typeof(float), typeof(bool) })]
+    [HarmonyPrefix]
+    private static void FarmerRenderer_draw_Prefix(Farmer who, ref AppearanceState? __state)
+    {
+        if (!ReferenceEquals(who, Game1.player))
+            return;
+
+        if (EquipmentManager.GetActiveSet() != EquipmentManager.SetVisual)
+            return;
+
+        Hat? hat = EquipmentManager.GetVisualHat();
+        Clothing? shirt = EquipmentManager.GetVisualShirt();
+        Clothing? pants = EquipmentManager.GetVisualPants();
+        Boots? boots = EquipmentManager.GetVisualItem(VisualSlot.Boots) as Boots;
+
+        if (hat == null && shirt == null && pants == null && boots == null)
+            return;
+
+        __state = new AppearanceState(who.hat.Value, who.shirtItem.Value, who.pantsItem.Value, who.boots.Value);
+
+        GearState realGear = __state!.ToGearState();
+        VisualSwapContext.Begin(realGear);
+
+        if (hat != null)
+            who.hat.Value = hat;
+        if (shirt != null)
+            who.shirtItem.Value = shirt;
+        if (pants != null)
+            who.pantsItem.Value = pants;
+        if (boots != null)
+            who.boots.Value = boots;
+    }
+
+    [HarmonyPatch(typeof(FarmerRenderer), nameof(FarmerRenderer.draw), new[] { typeof(SpriteBatch), typeof(Farmer), typeof(int), typeof(Vector2), typeof(float), typeof(bool) })]
+    [HarmonyPostfix]
+    private static void FarmerRenderer_draw_Postfix(Farmer who, AppearanceState? __state)
+    {
+        if (__state == null)
+            return;
+
+        who.hat.Value = __state.Hat;
+        who.shirtItem.Value = __state.Shirt;
+        who.pantsItem.Value = __state.Pants;
+        who.boots.Value = __state.Boots;
+
+        VisualSwapContext.End();
+    }
+
+    private sealed record AppearanceState(Hat? Hat, Clothing? Shirt, Clothing? Pants, Boots? Boots)
+    {
+        internal GearState ToGearState() => new GearState(Hat, Shirt, Pants, Boots, null, null);
+    };
+
+    private static void DrawToggleButton(InventoryPage page, SpriteBatch b)
+    {
+        Rectangle bounds = GetToggleBounds(page);
+        IClickableMenu.drawTextureBox(
+            b,
+            bounds.X,
+            bounds.Y,
+            bounds.Width,
+            bounds.Height,
+            EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual ? Color.LightGreen : Color.White
+        );
+
+        b.Draw(Game1.menuTexture, new Vector2(bounds.X + 8, bounds.Y + 8), ToggleSourceRect, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 1f);
+        SpriteText.drawString(b, EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual ? "V" : "E", bounds.X + 18, bounds.Y + 14);
+    }
+
+    private static Rectangle GetToggleBounds(InventoryPage page)
+    {
+        Rectangle? preview = TryFindPlayerPreviewBounds(page);
+        if (preview != null)
+        {
+            int x = preview.Value.X + ToggleInset + ToggleOffsetX;
+            int y = preview.Value.Y + ToggleInset + ToggleOffsetY;
+            return new Rectangle(x, y, ToggleSize, ToggleSize);
+        }
+
+        return new Rectangle(page.xPositionOnScreen + 100, page.yPositionOnScreen + 50, ToggleSize, ToggleSize);
+    }
+
+    private static Rectangle? TryFindPlayerPreviewBounds(InventoryPage page)
+    {
+        Rectangle? byName = TryGetBounds(page, ["portrait", "Portrait", "playerPortrait", "characterPortrait", "farmerBox", "characterBox", "playerBox"]);
+        if (byName != null)
+            return byName;
+
+        Rectangle? best = null;
+        int bestScore = int.MinValue;
+
+        foreach (FieldInfo field in page.GetType().GetFields(AnyInstance))
+        {
+            object? obj;
+            try
+            {
+                obj = field.GetValue(page);
+            }
+            catch
+            {
+                continue;
+            }
+
+            Rectangle? bounds = obj switch
+            {
+                ClickableTextureComponent ctc => ctc.bounds,
+                ClickableComponent cc => cc.bounds,
+                _ => null
+            };
+
+            if (bounds == null)
+                continue;
+
+            Rectangle r = bounds.Value;
+            if (r.Width < 96 || r.Height < 96)
+                continue;
+
+            int area = r.Width * r.Height;
+            int dx = Math.Abs(r.X - page.xPositionOnScreen);
+            int dy = Math.Abs(r.Y - page.yPositionOnScreen);
+            int score = area - (dx * 5) - (dy * 5);
+
+            if (score > bestScore)
+            {
+                best = r;
+                bestScore = score;
+            }
+        }
+
+        return best;
+    }
+
+    private static Rectangle? TryGetBounds(InventoryPage page, string[] candidateNames)
+    {
+        foreach (string name in candidateNames)
+        {
+            FieldInfo? field = page.GetType().GetField(name, AnyInstance);
+            if (field == null)
+                continue;
+
+            object? obj = field.GetValue(page);
+            if (obj is ClickableTextureComponent ctc)
+                return ctc.bounds;
+            if (obj is ClickableComponent cc)
+                return cc.bounds;
+        }
+
+        return null;
+    }
+}

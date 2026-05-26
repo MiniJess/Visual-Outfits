@@ -1,0 +1,10 @@
+{
+  "Name": "Visual Outfits",
+  "Author": "Jessia",
+  "Version": "0.1.0",
+  "Description": "Switch between saved outfit looks without changing equipment stats (work in progress).",
+  "UniqueID": "Jessia.VisualOutfits",
+  "EntryDll": "VisualOutfits.dll",
+  "MinimumApiVersion": "4.0.0"
+}
+

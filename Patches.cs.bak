@@ -1,0 +1,497 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using StardewModdingAPI;
+using StardewValley;
+using StardewValley.BellsAndWhistles;
+using StardewValley.Menus;
+using StardewValley.Objects;
+
+namespace VisualOutfits;
+
+[HarmonyPatch]
+public static class Patches
+{
+    // Toggle button tweak knobs.
+    private const int ToggleSize = 48;
+    private const int ToggleInset = 8;
+    private const int ToggleOffsetX = 0;
+    private const int ToggleOffsetY = 0;
+
+    private static readonly Rectangle ToggleSourceRect = new(128, 256, 64, 64);
+
+    private static readonly BindingFlags AnyInstance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    private static readonly FieldInfo? HeldItemField = typeof(IClickableMenu).GetField("heldItem", AnyInstance);
+    private static readonly PropertyInfo? HeldItemProperty = typeof(IClickableMenu).GetProperty("heldItem", AnyInstance);
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.draw), new[] { typeof(SpriteBatch) })]
+    [HarmonyPrefix]
+    private static void InventoryPage_draw_Prefix(ref InventoryEquipState? __state)
+    {
+        if (EquipmentManager.GetActiveSet() != EquipmentManager.SetVisual)
+            return;
+
+        Farmer player = Game1.player;
+        __state = new InventoryEquipState(
+            player.hat.Value,
+            player.shirtItem.Value,
+            player.pantsItem.Value,
+            player.boots.Value,
+            player.leftRing.Value,
+            player.rightRing.Value
+        );
+
+        // Make the vanilla equipment slots look empty while keeping gameplay effects.
+        // We'll restore immediately after drawing the page.
+        player.hat.Value = null;
+        player.shirtItem.Value = null;
+        player.pantsItem.Value = null;
+        player.boots.Value = null;
+        player.leftRing.Value = null;
+        player.rightRing.Value = null;
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.draw), new[] { typeof(SpriteBatch) })]
+    [HarmonyPostfix]
+    private static void InventoryPage_draw_Postfix(InventoryPage __instance, SpriteBatch b, InventoryEquipState? __state)
+    {
+        DrawToggleButton(__instance, b);
+
+        bool isVisual = EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual;
+        if (isVisual && TryGetEquipmentSlotBounds(__instance, out var boundsBySlot))
+        {
+            foreach (var pair in boundsBySlot)
+            {
+                Item? item = EquipmentManager.GetVisualItem(pair.Key);
+                if (item != null)
+                    item.drawInMenu(b, new Vector2(pair.Value.X, pair.Value.Y), 1f);
+            }
+        }
+
+        // Always restore equipment if we cleared it in the prefix.
+        if (__state != null)
+        {
+            Farmer player = Game1.player;
+            player.hat.Value = __state.Hat;
+            player.shirtItem.Value = __state.Shirt;
+            player.pantsItem.Value = __state.Pants;
+            player.boots.Value = __state.Boots;
+            player.leftRing.Value = __state.LeftRing;
+            player.rightRing.Value = __state.RightRing;
+        }
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.receiveLeftClick))]
+    [HarmonyPrefix]
+    private static bool InventoryPage_receiveLeftClick_Prefix(InventoryPage __instance, int x, int y, bool playSound = true)
+    {
+        Rectangle toggleBounds = GetToggleBounds(__instance);
+        if (toggleBounds.Contains(x, y))
+        {
+            EquipmentManager.ToggleActiveSet();
+            if (playSound)
+                Game1.playSound("button1");
+            return false;
+        }
+
+        if (EquipmentManager.GetActiveSet() != EquipmentManager.SetVisual)
+            return true;
+
+        if (TryResolveSlotFromClick(__instance, x, y, out VisualSlot slot))
+        {
+            HandleVisualSlotClick(slot, playSound);
+            return false;
+        }
+
+        // If it's in the equipment area but we couldn't resolve, swallow to avoid equipping real gear.
+        if (TryGetEquipmentAreaBounds(__instance, out Rectangle equipmentArea) && equipmentArea.Contains(x, y))
+            return false;
+
+        return true;
+    }
+
+    [HarmonyPatch(typeof(InventoryPage), nameof(InventoryPage.receiveRightClick))]
+    [HarmonyPrefix]
+    private static bool InventoryPage_receiveRightClick_Prefix(InventoryPage __instance, int x, int y, bool playSound = true)
+    {
+        if (EquipmentManager.GetActiveSet() != EquipmentManager.SetVisual)
+            return true;
+
+        if (TryResolveSlotFromClick(__instance, x, y, out VisualSlot slot))
+        {
+            // Right-click behavior: quick unequip to cursor (if cursor empty).
+            IClickableMenu? menu = Game1.activeClickableMenu;
+            if (menu == null)
+                return false;
+
+            if (GetHeldItem(menu) == null)
+                HandleVisualSlotClick(slot, playSound);
+
+            return false;
+        }
+
+        if (TryGetEquipmentAreaBounds(__instance, out Rectangle equipmentArea) && equipmentArea.Contains(x, y))
+            return false;
+
+        return true;
+    }
+
+    [HarmonyPatch(typeof(FarmerRenderer), nameof(FarmerRenderer.draw), new[] { typeof(SpriteBatch), typeof(Farmer), typeof(int), typeof(Vector2), typeof(float), typeof(bool) })]
+    [HarmonyPrefix]
+    private static void FarmerRenderer_draw_Prefix(Farmer who, ref AppearanceState? __state)
+    {
+        if (!ReferenceEquals(who, Game1.player))
+            return;
+
+        Hat? hat = EquipmentManager.GetVisualHat();
+        Clothing? shirt = EquipmentManager.GetVisualShirt();
+        Clothing? pants = EquipmentManager.GetVisualPants();
+        Boots? boots = EquipmentManager.GetVisualItem(VisualSlot.Boots) as Boots;
+
+        if (hat == null && shirt == null && pants == null && boots == null)
+            return;
+
+        __state = new AppearanceState(who.hat.Value, who.shirtItem.Value, who.pantsItem.Value, who.boots.Value);
+
+        if (hat != null)
+            who.hat.Value = hat;
+        if (shirt != null)
+            who.shirtItem.Value = shirt;
+        if (pants != null)
+            who.pantsItem.Value = pants;
+        if (boots != null)
+            who.boots.Value = boots;
+    }
+
+    [HarmonyPatch(typeof(FarmerRenderer), nameof(FarmerRenderer.draw), new[] { typeof(SpriteBatch), typeof(Farmer), typeof(int), typeof(Vector2), typeof(float), typeof(bool) })]
+    [HarmonyPostfix]
+    private static void FarmerRenderer_draw_Postfix(Farmer who, AppearanceState? __state)
+    {
+        if (__state == null)
+            return;
+
+        who.hat.Value = __state.Hat;
+        who.shirtItem.Value = __state.Shirt;
+        who.pantsItem.Value = __state.Pants;
+        who.boots.Value = __state.Boots;
+    }
+
+    private sealed record AppearanceState(Hat? Hat, Clothing? Shirt, Clothing? Pants, Boots? Boots);
+    private sealed record InventoryEquipState(Hat? Hat, Clothing? Shirt, Clothing? Pants, Boots? Boots, Ring? LeftRing, Ring? RightRing);
+
+    private static void HandleVisualSlotClick(VisualSlot slot, bool playSound)
+    {
+        IClickableMenu? menu = Game1.activeClickableMenu;
+        if (menu == null)
+            return;
+
+        Item? held = GetHeldItem(menu);
+        Item? current = EquipmentManager.GetVisualItem(slot);
+
+        if (held == null)
+        {
+            if (current == null)
+                return;
+
+            SetHeldItem(menu, current);
+            EquipmentManager.SetVisualItem(slot, null);
+            if (playSound)
+                Game1.playSound("dwop");
+            return;
+        }
+
+        if (!EquipmentManager.IsValidItemForSlot(slot, held))
+        {
+            if (playSound)
+                Game1.playSound("cancel");
+            return;
+        }
+
+        try
+        {
+            EquipmentManager.SetVisualItem(slot, held);
+            SetHeldItem(menu, current);
+            if (playSound)
+                Game1.playSound("coin");
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log?.Log(ex.Message, LogLevel.Warn);
+            if (playSound)
+                Game1.playSound("cancel");
+        }
+    }
+
+    private static Item? GetHeldItem(IClickableMenu menu)
+    {
+        if (HeldItemProperty?.CanRead == true && HeldItemProperty.GetIndexParameters().Length == 0)
+            return HeldItemProperty.GetValue(menu) as Item;
+
+        return HeldItemField?.GetValue(menu) as Item;
+    }
+
+    private static void SetHeldItem(IClickableMenu menu, Item? item)
+    {
+        if (HeldItemProperty?.CanWrite == true && HeldItemProperty.GetIndexParameters().Length == 0)
+        {
+            HeldItemProperty.SetValue(menu, item);
+            return;
+        }
+
+        HeldItemField?.SetValue(menu, item);
+    }
+
+    private static void DrawToggleButton(InventoryPage page, SpriteBatch b)
+    {
+        Rectangle bounds = GetToggleBounds(page);
+        IClickableMenu.drawTextureBox(
+            b,
+            bounds.X,
+            bounds.Y,
+            bounds.Width,
+            bounds.Height,
+            EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual ? Color.LightGreen : Color.White
+        );
+
+        b.Draw(Game1.menuTexture, new Vector2(bounds.X + 8, bounds.Y + 8), ToggleSourceRect, Color.White, 0f, Vector2.Zero, 0.5f, SpriteEffects.None, 1f);
+        SpriteText.drawString(b, EquipmentManager.GetActiveSet() == EquipmentManager.SetVisual ? "V" : "E", bounds.X + 18, bounds.Y + 14);
+    }
+
+    private static Rectangle GetToggleBounds(InventoryPage page)
+    {
+        Rectangle? preview = TryFindPlayerPreviewBounds(page);
+        if (preview != null)
+        {
+            int x = preview.Value.X + ToggleInset + ToggleOffsetX;
+            int y = preview.Value.Y + ToggleInset + ToggleOffsetY;
+            return new Rectangle(x, y, ToggleSize, ToggleSize);
+        }
+
+        return new Rectangle(page.xPositionOnScreen + 100, page.yPositionOnScreen + 50, ToggleSize, ToggleSize);
+    }
+
+    private static Rectangle? TryFindPlayerPreviewBounds(InventoryPage page)
+    {
+        Rectangle? byName = TryGetBounds(page, ["portrait", "Portrait", "playerPortrait", "characterPortrait", "farmerBox", "characterBox", "playerBox"]);
+        if (byName != null)
+            return byName;
+
+        Rectangle? best = null;
+        int bestScore = int.MinValue;
+
+        foreach (FieldInfo field in page.GetType().GetFields(AnyInstance))
+        {
+            object? obj;
+            try
+            {
+                obj = field.GetValue(page);
+            }
+            catch
+            {
+                continue;
+            }
+
+            Rectangle? bounds = obj switch
+            {
+                ClickableTextureComponent ctc => ctc.bounds,
+                ClickableComponent cc => cc.bounds,
+                _ => null
+            };
+
+            if (bounds == null)
+                continue;
+
+            Rectangle r = bounds.Value;
+            if (r.Width < 96 || r.Height < 96)
+                continue;
+
+            int area = r.Width * r.Height;
+            int dx = Math.Abs(r.X - page.xPositionOnScreen);
+            int dy = Math.Abs(r.Y - page.yPositionOnScreen);
+            int score = area - (dx * 5) - (dy * 5);
+
+            if (score > bestScore)
+            {
+                best = r;
+                bestScore = score;
+            }
+        }
+
+        return best;
+    }
+
+    private static bool TryResolveSlotFromClick(InventoryPage page, int x, int y, out VisualSlot slot)
+    {
+        slot = default;
+
+        if (!TryGetEquipmentSlotBounds(page, out var boundsBySlot))
+            return false;
+
+        foreach (var pair in boundsBySlot)
+        {
+            if (pair.Value.Contains(x, y))
+            {
+                slot = pair.Key;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetEquipmentAreaBounds(InventoryPage page, out Rectangle bounds)
+    {
+        bounds = Rectangle.Empty;
+
+        if (TryGetEquipmentSlotBounds(page, out var boundsBySlot))
+        {
+            int minX = int.MaxValue;
+            int minY = int.MaxValue;
+            int maxX = int.MinValue;
+            int maxY = int.MinValue;
+
+            foreach (var pair in boundsBySlot)
+            {
+                Rectangle r = pair.Value;
+                minX = Math.Min(minX, r.X);
+                minY = Math.Min(minY, r.Y);
+                maxX = Math.Max(maxX, r.Right);
+                maxY = Math.Max(maxY, r.Bottom);
+            }
+
+            const int pad = 16;
+            bounds = new Rectangle(minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetEquipmentSlotBounds(InventoryPage page, out Dictionary<VisualSlot, Rectangle> boundsBySlot)
+    {
+        if (TryGetEquipmentSlotBoundsFromClickableComponents(page, out boundsBySlot))
+            return true;
+
+        TryGetEquipmentSlotBoundsHardcoded(page, out boundsBySlot);
+        return boundsBySlot.Count > 0;
+    }
+
+    private static bool TryGetEquipmentSlotBoundsFromClickableComponents(InventoryPage page, out Dictionary<VisualSlot, Rectangle> boundsBySlot)
+    {
+        boundsBySlot = new Dictionary<VisualSlot, Rectangle>();
+
+        if (page.allClickableComponents == null || page.allClickableComponents.Count == 0)
+            return false;
+
+        int minX = int.MaxValue;
+        var candidates = new List<ClickableComponent>();
+
+        foreach (ClickableComponent comp in page.allClickableComponents)
+        {
+            if (comp == null)
+                continue;
+
+            Rectangle r = comp.bounds;
+
+            // Equipment slots are 64x64-ish.
+            if (r.Width < 56 || r.Width > 80 || r.Height < 56 || r.Height > 80)
+                continue;
+
+            // Left panel only (avoid inventory grid).
+            if (r.X < page.xPositionOnScreen || r.X > page.xPositionOnScreen + 260)
+                continue;
+
+            if (r.Y < page.yPositionOnScreen || r.Y > page.yPositionOnScreen + 600)
+                continue;
+
+            candidates.Add(comp);
+            minX = Math.Min(minX, r.X);
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        var column = new List<ClickableComponent>();
+        foreach (ClickableComponent comp in candidates)
+        {
+            if (Math.Abs(comp.bounds.X - minX) <= 12)
+                column.Add(comp);
+        }
+
+        column.Sort((a, b) => a.bounds.Y.CompareTo(b.bounds.Y));
+
+        if (column.Count >= 4)
+        {
+            boundsBySlot[VisualSlot.Hat] = column[0].bounds;
+            boundsBySlot[VisualSlot.Shirt] = column[1].bounds;
+            boundsBySlot[VisualSlot.Pants] = column[2].bounds;
+            boundsBySlot[VisualSlot.Boots] = column[3].bounds;
+
+            int pantsY = column[2].bounds.Y;
+            int bootsY = column[3].bounds.Y;
+
+            var ringCandidates = new List<ClickableComponent>();
+            foreach (ClickableComponent comp in candidates)
+            {
+                if (Math.Abs(comp.bounds.X - minX) <= 12)
+                    continue;
+
+                if (comp.bounds.X <= minX + 20)
+                    continue;
+
+                // Rings are usually near the clothing column vertically.
+                if (comp.bounds.Y < pantsY - 32 || comp.bounds.Y > bootsY + 220)
+                    continue;
+
+                ringCandidates.Add(comp);
+            }
+
+            ringCandidates.Sort((a, b) => a.bounds.X != b.bounds.X ? a.bounds.X.CompareTo(b.bounds.X) : a.bounds.Y.CompareTo(b.bounds.Y));
+
+            if (ringCandidates.Count >= 2)
+            {
+                boundsBySlot[VisualSlot.LeftRing] = ringCandidates[0].bounds;
+                boundsBySlot[VisualSlot.RightRing] = ringCandidates[1].bounds;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void TryGetEquipmentSlotBoundsHardcoded(InventoryPage page, out Dictionary<VisualSlot, Rectangle> boundsBySlot)
+    {
+        boundsBySlot = new Dictionary<VisualSlot, Rectangle>();
+
+        int baseX = page.xPositionOnScreen + 48;
+        int baseY = page.yPositionOnScreen + IClickableMenu.borderWidth + IClickableMenu.spaceToClearTopBorder;
+
+        boundsBySlot[VisualSlot.Hat] = new Rectangle(baseX, baseY + 4, 64, 64);
+        boundsBySlot[VisualSlot.Shirt] = new Rectangle(baseX, baseY + 68, 64, 64);
+        boundsBySlot[VisualSlot.Pants] = new Rectangle(baseX, baseY + 132, 64, 64);
+        boundsBySlot[VisualSlot.Boots] = new Rectangle(baseX, baseY + 196, 64, 64);
+    }
+
+    private static Rectangle? TryGetBounds(InventoryPage page, string[] candidateNames)
+    {
+        foreach (string name in candidateNames)
+        {
+            FieldInfo? field = page.GetType().GetField(name, AnyInstance);
+            if (field == null)
+                continue;
+
+            object? obj = field.GetValue(page);
+            if (obj is ClickableTextureComponent ctc)
+                return ctc.bounds;
+            if (obj is ClickableComponent cc)
+                return cc.bounds;
+        }
+
+        return null;
+    }
+}
